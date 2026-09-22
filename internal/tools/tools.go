@@ -224,6 +224,14 @@ type lsEntry struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
+// lsResult wraps the entry list in an object because MCP's
+// structuredContent must be a JSON object, not a bare array — a client
+// that validates against the spec (as the desktop app's MCP client does)
+// rejects a top-level array outright.
+type lsResult struct {
+	Entries []lsEntry `json:"entries"`
+}
+
 func registerLs(server *mcp.Server, sb *sandbox.Sandbox) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "ls",
@@ -256,7 +264,8 @@ func registerLs(server *mcp.Server, sb *sandbox.Sandbox) {
 			}
 			out = append(out, lsEntry{Name: e.Name(), Type: typ, SizeBytes: size})
 		}
-		return jsonResult(out), out, nil
+		res := lsResult{Entries: out}
+		return jsonResult(res), res, nil
 	})
 }
 
@@ -301,6 +310,12 @@ func registerRm(server *mcp.Server, sb *sandbox.Sandbox) {
 // list_allowed_dirs
 // ---------------------------------------------------------------------------
 
+// allowedDirsResult wraps the roots list in an object for the same reason
+// as lsResult above: structuredContent must be a JSON object.
+type allowedDirsResult struct {
+	Roots []sandbox.Root `json:"roots"`
+}
+
 func registerListAllowedDirs(server *mcp.Server, sb *sandbox.Sandbox) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "list_allowed_dirs",
@@ -308,8 +323,8 @@ func registerListAllowedDirs(server *mcp.Server, sb *sandbox.Sandbox) {
 			"and whether each came from launch config or from the connected client's MCP roots.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, any, error) {
 		refreshClientRoots(ctx, req, sb)
-		roots := sb.Roots()
-		return jsonResult(roots), roots, nil
+		res := allowedDirsResult{Roots: sb.Roots()}
+		return jsonResult(res), res, nil
 	})
 }
 
