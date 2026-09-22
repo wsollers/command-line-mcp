@@ -792,3 +792,257 @@ func TestReleaseBlobUnknownHandle(t *testing.T) {
 		t.Errorf("release_blob reported released=true for an unknown handle")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// find
+// ---------------------------------------------------------------------------
+
+func mustWriteFile(t *testing.T, root, rel, content string) {
+	t.Helper()
+	p := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFindByNameGlob(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "a.go", "package a")
+	mustWriteFile(t, root, "b.txt", "not go")
+	mustWriteFile(t, root, "sub/c.go", "package sub")
+	session := testServer(t, root)
+
+	res := callTool(t, session, "find", map[string]any{"root": ".", "name_glob": "**/*.go"})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", textOf(t, res))
+	}
+	var out findResult
+	structuredAs(t, res, &out)
+	if out.Count != 2 {
+		t.Fatalf("Count = %d, want 2 (matches: %+v)", out.Count, out.Matches)
+	}
+}
+
+func TestFindByContentRegex(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "has.txt", "TODO: fix this")
+	mustWriteFile(t, root, "hasnot.txt", "all done")
+	session := testServer(t, root)
+
+	res := callTool(t, session, "find", map[string]any{"root": ".", "content_regex": `\bTODO\b`})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", textOf(t, res))
+	}
+	var out findResult
+	structuredAs(t, res, &out)
+	if out.Count != 1 || out.Matches[0].Path != "has.txt" {
+		t.Errorf("Matches = %+v, want just has.txt", out.Matches)
+	}
+}
+
+func TestFindInvalidNameGlob(t *testing.T) {
+	root := t.TempDir()
+	session := testServer(t, root)
+	res := callTool(t, session, "find", map[string]any{"root": ".", "name_glob": "[unterminated"})
+	if !res.IsError {
+		t.Fatal("expected an error for an invalid name_glob pattern")
+	}
+	if code := errCodeOf(t, res); code != codeInvalidGlob {
+		t.Errorf("code = %q, want %q", code, codeInvalidGlob)
+	}
+}
+
+func TestFindInvalidContentRegex(t *testing.T) {
+	root := t.TempDir()
+	session := testServer(t, root)
+	res := callTool(t, session, "find", map[string]any{"root": ".", "content_regex": "("})
+	if !res.IsError {
+		t.Fatal("expected an error for an invalid content_regex pattern")
+	}
+	if code := errCodeOf(t, res); code != codeInvalidRegex {
+		t.Errorf("code = %q, want %q", code, codeInvalidRegex)
+	}
+}
+
+func TestFindRootNotADirectory(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "file.txt", "x")
+	session := testServer(t, root)
+	res := callTool(t, session, "find", map[string]any{"root": "file.txt"})
+	if !res.IsError {
+		t.Fatal("expected an error when root is a file, not a directory")
+	}
+	if code := errCodeOf(t, res); code != codeNotADirectory {
+		t.Errorf("code = %q, want %q", code, codeNotADirectory)
+	}
+}
+
+func TestFindMaxResultsTruncates(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		mustWriteFile(t, root, name, "x")
+	}
+	session := testServer(t, root)
+	res := callTool(t, session, "find", map[string]any{"root": ".", "max_results": 2})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", textOf(t, res))
+	}
+	var out findResult
+	structuredAs(t, res, &out)
+	if out.Count != 2 || !out.Truncated {
+		t.Errorf("Count = %d, Truncated = %v, want 2, true", out.Count, out.Truncated)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// replace
+// ---------------------------------------------------------------------------
+
+func TestReplaceLiteralDryRun(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "a.txt", "OldName is OldName")
+	session := testServer(t, root)
+
+	res := callTool(t, session, "replace", map[string]any{
+		"root": ".", "search": "OldName", "replace": "NewName", "dry_run": true,
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", textOf(t, res))
+	}
+	var out replaceResult
+	structuredAs(t, res, &out)
+	if out.TotalReplacements != 2 || out.FilesChanged != 1 {
+		t.Fatalf("TotalReplacements = %d, FilesChanged = %d, want 2, 1", out.TotalReplacements, out.FilesChanged)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "OldName is OldName" {
+		t.Errorf("dry_run modified the file: content = %q", got)
+	}
+}
+
+func TestReplaceLiteralWrites(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "a.txt", "OldName is OldName")
+	mustWriteFile(t, root, "b.txt", "unrelated content")
+	session := testServer(t, root)
+
+	res := callTool(t, session, "replace", map[string]any{
+		"root": ".", "search": "OldName", "replace": "NewName",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", textOf(t, res))
+	}
+	var out replaceResult
+	structuredAs(t, res, &out)
+	if out.TotalReplacements != 2 || out.FilesChanged != 1 {
+		t.Fatalf("TotalReplacements = %d, FilesChanged = %d, want 2, 1", out.TotalReplacements, out.FilesChanged)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "NewName is NewName" {
+		t.Errorf("content = %q, want %q", got, "NewName is NewName")
+	}
+	unrelated, err := os.ReadFile(filepath.Join(root, "b.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(unrelated) != "unrelated content" {
+		t.Errorf("replace touched a file with no match: content = %q", unrelated)
+	}
+}
+
+func TestReplaceRegexWithCaptureGroup(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "a.txt", "call foo(1, 2) and foo(3, 4)")
+	session := testServer(t, root)
+
+	res := callTool(t, session, "replace", map[string]any{
+		"root": ".", "search": `foo\(([0-9]+), ([0-9]+)\)`, "replace": "bar($2, $1)", "is_regex": true,
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", textOf(t, res))
+	}
+	got, err := os.ReadFile(filepath.Join(root, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "call bar(2, 1) and bar(4, 3)"
+	if string(got) != want {
+		t.Errorf("content = %q, want %q", got, want)
+	}
+}
+
+func TestReplaceHonorsNameGlob(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, root, "a.go", "OldName")
+	mustWriteFile(t, root, "b.txt", "OldName")
+	session := testServer(t, root)
+
+	res := callTool(t, session, "replace", map[string]any{
+		"root": ".", "name_glob": "**/*.go", "search": "OldName", "replace": "NewName",
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", textOf(t, res))
+	}
+	var out replaceResult
+	structuredAs(t, res, &out)
+	if out.FilesChanged != 1 || out.Files[0].Path != "a.go" {
+		t.Fatalf("Files = %+v, want just a.go changed", out.Files)
+	}
+	txt, err := os.ReadFile(filepath.Join(root, "b.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(txt) != "OldName" {
+		t.Errorf("replace touched b.txt despite name_glob excluding it: content = %q", txt)
+	}
+}
+
+func TestReplaceSkipsBinaryFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "bin.dat"), []byte{0xff, 0x00, 'O', 'l', 'd'}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	session := testServer(t, root)
+	res := callTool(t, session, "replace", map[string]any{"root": ".", "search": "Old", "replace": "New"})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", textOf(t, res))
+	}
+	var out replaceResult
+	structuredAs(t, res, &out)
+	if out.FilesChanged != 0 {
+		t.Errorf("FilesChanged = %d, want 0 (binary file must be skipped, not corrupted)", out.FilesChanged)
+	}
+}
+
+func TestReplaceEmptySearchRejected(t *testing.T) {
+	root := t.TempDir()
+	session := testServer(t, root)
+	res := callTool(t, session, "replace", map[string]any{"root": ".", "search": "", "replace": "x"})
+	if !res.IsError {
+		t.Fatal("expected an error for an empty search string")
+	}
+	if code := errCodeOf(t, res); code != codeInvalidArgument {
+		t.Errorf("code = %q, want %q", code, codeInvalidArgument)
+	}
+}
+
+func TestReplaceInvalidRegex(t *testing.T) {
+	root := t.TempDir()
+	session := testServer(t, root)
+	res := callTool(t, session, "replace", map[string]any{"root": ".", "search": "(", "replace": "x", "is_regex": true})
+	if !res.IsError {
+		t.Fatal("expected an error for an invalid regex search pattern")
+	}
+	if code := errCodeOf(t, res); code != codeInvalidRegex {
+		t.Errorf("code = %q, want %q", code, codeInvalidRegex)
+	}
+}

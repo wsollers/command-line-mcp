@@ -461,7 +461,7 @@ doesn't need content predicates or actions.
 
 ---
 
-# 6. File replacement — *Adopted, not yet built; exposed narrowly (see §9.0)*
+# 6. File replacement — *Shipped, exposed narrowly (see §9.0); see §9.2 for status*
 
 `literal_replace` and `regex_replace` exist in this spec only as **actions**
 inside the internal treewalker engine (§10.5, §10.6), invoked through the
@@ -586,10 +586,21 @@ So the engine is layered:
   hand, which should be an explicit, deliberate choice by whoever's running
   the server, not the default shape of the API.
 
-## 8.1 `tree_walk` engine — *Layer 1, internal; adopted, not yet built*
+## 8.1 `tree_walk` engine — *Layer 1, internal; shipped as a working subset*
 
 Recursively traverses a subtree, evaluates a predicate per entry, applies
 actions where it's true. Never executes arbitrary embedded code.
+
+`internal/walk` implements exactly the subset `find`/`replace` need today:
+predicates `is_file`, `path_glob`, `content_regex`, combined with an `All`
+combinator; no separate `report` action object (Walk itself is read-only
+and returns matches; `find`/`replace` apply their own action to what it
+returns). The rest of §8.2/§8.3's predicate and action vocabulary, the
+`any`/`not` combinators, `max_depth`, `order`, `include_hidden` as a
+caller-set option (hidden entries are always skipped, unconditionally —
+see `internal/walk`'s package doc), and `follow_symlinks: true` are all
+still *adopted, not yet built* — extending `internal/walk`'s `Predicate`
+set is how each of those gets added later, not a rewrite of the package.
 
 ```json
 {
@@ -645,7 +656,7 @@ planned actions with no mutation — same shape as the source proposal's §13.
 
 # 9. Layer 2: narrow tools over the treewalker
 
-## 9.1 `find` — *Adopted, not yet built*
+## 9.1 `find` — *Shipped, minus `max_results` continuation (see §13)*
 
 ```json
 {
@@ -664,7 +675,7 @@ bounds) gets its own named, flat, optional argument here rather than a
 generic predicate slot — the list of fields can grow; the DSL doesn't need
 to be exposed to grow it.
 
-## 9.2 `replace` — *Adopted, not yet built*
+## 9.2 `replace` — *Shipped, minus atomicity/preconditions (§12) and `max_results` continuation (§13)*
 
 ```json
 {
@@ -806,8 +817,8 @@ naming is referenced throughout this document:
 | `add_allowed_dir` / `remove_allowed_dir` | — (no equivalent) | Shipped |
 | `fs.stat` | `fs.stat` | Adopted, not built |
 | `fs.glob` | `fs.glob` | Adopted, not built |
-| `find` | (narrowed from `fs.replace`-style flat tools + walker) | Adopted, not built |
-| `replace` | `fs.replace` + `fs.regex_replace` (merged, narrowed) | Adopted, not built |
+| `find` | (narrowed from `fs.replace`-style flat tools + walker) | Shipped (`max_results` continuation adopted, not built) |
+| `replace` | `fs.replace` + `fs.regex_replace` (merged, narrowed) | Shipped (atomicity/preconditions, `max_results` continuation adopted, not built) |
 | `tree_walk` | `tree.walk` | Deferred, operator-gated |
 | `move_file` | `fs.move` | Deferred |
 | `fs.write_range` | `fs.write_range` | Deferred |

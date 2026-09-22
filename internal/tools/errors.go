@@ -8,6 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/wsollers/command-line-mcp/internal/blob"
+	"github.com/wsollers/command-line-mcp/internal/rgx"
 	"github.com/wsollers/command-line-mcp/internal/sandbox"
 )
 
@@ -30,6 +31,10 @@ const (
 	codeBlobExpired        errorCode = "BLOB_EXPIRED"
 	codeInvalidArgument    errorCode = "INVALID_ARGUMENT"
 	codeProcessStartFailed errorCode = "PROCESS_START_FAILED"
+	codeNotADirectory      errorCode = "NOT_A_DIRECTORY"
+	codeInvalidGlob        errorCode = "INVALID_GLOB"
+	codeInvalidRegex       errorCode = "INVALID_REGEX"
+	codeUnsupportedRegex   errorCode = "UNSUPPORTED_REGEX_SYNTAX"
 	codeIOError            errorCode = "IO_ERROR"
 )
 
@@ -119,4 +124,16 @@ func blobErrCode(err error) errorCode {
 	default:
 		return codeIOError
 	}
+}
+
+// regexErrCode distinguishes internal/rgx's two failure kinds per
+// docs/api-spec.md §4: a recognized-but-untranslatable Rust-regex
+// construct (*rgx.UnsupportedSyntaxError) versus any other pattern Go's
+// regexp itself rejects as malformed.
+func regexErrCode(err error) errorCode {
+	var uerr *rgx.UnsupportedSyntaxError
+	if errors.As(err, &uerr) {
+		return codeUnsupportedRegex
+	}
+	return codeInvalidRegex
 }

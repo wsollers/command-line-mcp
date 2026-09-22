@@ -10,14 +10,19 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/wsollers/command-line-mcp/internal/blob"
+	"github.com/wsollers/command-line-mcp/internal/glob"
 	"github.com/wsollers/command-line-mcp/internal/process"
+	"github.com/wsollers/command-line-mcp/internal/rgx"
 	"github.com/wsollers/command-line-mcp/internal/sandbox"
+	"github.com/wsollers/command-line-mcp/internal/walk"
 )
 
 // blobThresholdBytes is the read_file content size above which a result is
@@ -78,6 +83,8 @@ func Register(server *mcp.Server, sb *sandbox.Sandbox) {
 	registerMkdir(server, sb)
 	registerLs(server, sb)
 	registerRm(server, sb)
+	registerFind(server, sb)
+	registerReplace(server, sb)
 	registerListAllowedDirs(server, sb)
 	if sb.RuntimeAllowed() {
 		registerAddAllowedDir(server, sb)
@@ -552,6 +559,218 @@ func registerRm(server *mcp.Server, sb *sandbox.Sandbox) {
 			return errFromErr(err, args.Path), nil, nil
 		}
 		out := map[string]any{"path": args.Path, "removed": true}
+		return jsonResult(out), out, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// find
+// ---------------------------------------------------------------------------
+//
+// Layer 2 over internal/walk (docs/api-spec.md §9.1): a flat, named
+// argument set the caller fills in, rather than a predicate tree it has
+// to author. The handler builds a walk.Predicate server-side and never
+// exposes that shape as input.
+
+// resolveWalkRoot resolves and validates a Layer-2 tool's root argument:
+// it must exist, be inside the sandbox, and be a directory.
+func resolveWalkRoot(sb *sandbox.Sandbox, root string) (string, *mcp.CallToolResult) {
+	abs, err := sb.Resolve(root)
+	if err != nil {
+		return "", errFromErr(err, root)
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return "", errFromErr(err, root)
+	}
+	if !fi.IsDir() {
+		return "", codedError(codeNotADirectory, root, "root is not a directory", nil)
+	}
+	return abs, nil
+}
+
+type findArgs struct {
+	Root         string `json:"root" jsonschema:"directory to search, relative to the primary allowed root or absolute inside any allowed root"`
+	NameGlob     string `json:"name_glob,omitempty" jsonschema:"optional glob pattern (bash-like; ** matches any number of path segments) a file's path relative to root must match, e.g. \"**/*.go\""`
+	ContentRegex string `json:"content_regex,omitempty" jsonschema:"optional ripgrep-compatible regex (see internal/rgx) a file's content must contain at least one match of; files that aren't valid UTF-8 never match"`
+	MaxResults   int    `json:"max_results,omitempty" jsonschema:"cap on how many matches to return; defaults to 1000"`
+}
+
+type findMatch struct {
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+type findResult struct {
+	Root      string      `json:"root"`
+	Matches   []findMatch `json:"matches"`
+	Count     int         `json:"count"`
+	Truncated bool        `json:"truncated"`
+}
+
+func registerFind(server *mcp.Server, sb *sandbox.Sandbox) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "find",
+		Description: "Search a directory tree for files by name pattern and/or content, without hand-authoring a predicate tree. " +
+			"Builds a name_glob + content_regex filter server-side and reports matching files; never descends into a symlinked " +
+			"directory or a hidden (dot-prefixed) entry.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args findArgs) (*mcp.CallToolResult, any, error) {
+		refreshClientRoots(ctx, req, sb)
+		rootAbs, errRes := resolveWalkRoot(sb, args.Root)
+		if errRes != nil {
+			return errRes, nil, nil
+		}
+
+		pred := walk.All{walk.IsFile{}}
+		if args.NameGlob != "" {
+			if _, err := glob.Match(args.NameGlob, "probe"); err != nil {
+				return codedError(codeInvalidGlob, args.Root, fmt.Sprintf("invalid name_glob: %v", err),
+					map[string]any{"pattern": args.NameGlob}), nil, nil
+			}
+			pred = append(pred, walk.PathGlob{Patterns: []string{args.NameGlob}})
+		}
+		if args.ContentRegex != "" {
+			re, err := rgx.Compile(args.ContentRegex, rgx.DefaultOptions())
+			if err != nil {
+				return codedError(regexErrCode(err), args.Root, err.Error(),
+					map[string]any{"pattern": args.ContentRegex}), nil, nil
+			}
+			pred = append(pred, walk.ContentRegex{Re: re})
+		}
+
+		result, err := walk.Walk(walk.Options{
+			RootAbs:    rootAbs,
+			Sandbox:    sb,
+			Predicate:  pred,
+			MaxResults: args.MaxResults,
+		})
+		if err != nil {
+			return errFromErr(err, args.Root), nil, nil
+		}
+
+		matches := make([]findMatch, 0, len(result.Matches))
+		for _, m := range result.Matches {
+			matches = append(matches, findMatch{Path: m.Path, SizeBytes: m.Size})
+		}
+		out := findResult{Root: args.Root, Matches: matches, Count: len(matches), Truncated: result.Truncated}
+		return jsonResult(out), out, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// replace
+// ---------------------------------------------------------------------------
+//
+// Layer 2 over internal/walk (docs/api-spec.md §9.2): a name_glob filter
+// plus a literal or regex substitution, applied across every matched
+// file. Files that aren't valid UTF-8 are skipped (not an error) — there
+// is no "binary replace" here, same rationale as ContentRegex.
+
+type replaceArgs struct {
+	Root       string `json:"root" jsonschema:"directory to search, relative to the primary allowed root or absolute inside any allowed root"`
+	NameGlob   string `json:"name_glob,omitempty" jsonschema:"optional glob pattern (bash-like; ** matches any number of path segments) a file's path relative to root must match, e.g. \"src/**/*.rs\"; omit to consider every file under root"`
+	Search     string `json:"search" jsonschema:"text to find in each matched file, or (if is_regex) a ripgrep-compatible regex"`
+	Replace    string `json:"replace" jsonschema:"replacement text; in regex mode may reference capture groups as $1, ${name}, etc. (Go regexp.Expand syntax)"`
+	IsRegex    bool   `json:"is_regex,omitempty" jsonschema:"treat search as a regex (internal/rgx) instead of literal text"`
+	DryRun     bool   `json:"dry_run,omitempty" jsonschema:"if true, reports what would change without writing anything; recommended default at the call site for a multi-file replace"`
+	MaxResults int    `json:"max_results,omitempty" jsonschema:"cap on how many candidate files to consider; defaults to 1000"`
+}
+
+type replaceFileResult struct {
+	Path         string `json:"path"`
+	Replacements int    `json:"replacements"`
+}
+
+type replaceResult struct {
+	Root              string              `json:"root"`
+	DryRun            bool                `json:"dry_run"`
+	Files             []replaceFileResult `json:"files"`
+	FilesChanged      int                 `json:"files_changed"`
+	TotalReplacements int                 `json:"total_replacements"`
+	Truncated         bool                `json:"truncated"`
+}
+
+func registerReplace(server *mcp.Server, sb *sandbox.Sandbox) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "replace",
+		Description: "Find-and-replace text across every file under a directory matching an optional name glob, without hand-authoring " +
+			"a predicate/action tree. Call with dry_run: true first to preview what would change before writing anything.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args replaceArgs) (*mcp.CallToolResult, any, error) {
+		refreshClientRoots(ctx, req, sb)
+		if args.Search == "" {
+			return codedError(codeInvalidArgument, args.Root, "search must not be empty", nil), nil, nil
+		}
+		rootAbs, errRes := resolveWalkRoot(sb, args.Root)
+		if errRes != nil {
+			return errRes, nil, nil
+		}
+
+		pred := walk.All{walk.IsFile{}}
+		if args.NameGlob != "" {
+			if _, err := glob.Match(args.NameGlob, "probe"); err != nil {
+				return codedError(codeInvalidGlob, args.Root, fmt.Sprintf("invalid name_glob: %v", err),
+					map[string]any{"pattern": args.NameGlob}), nil, nil
+			}
+			pred = append(pred, walk.PathGlob{Patterns: []string{args.NameGlob}})
+		}
+
+		var re *regexp.Regexp
+		if args.IsRegex {
+			compiled, err := rgx.Compile(args.Search, rgx.DefaultOptions())
+			if err != nil {
+				return codedError(regexErrCode(err), args.Root, err.Error(),
+					map[string]any{"pattern": args.Search}), nil, nil
+			}
+			re = compiled
+		}
+
+		candidates, err := walk.Walk(walk.Options{
+			RootAbs:    rootAbs,
+			Sandbox:    sb,
+			Predicate:  pred,
+			MaxResults: args.MaxResults,
+		})
+		if err != nil {
+			return errFromErr(err, args.Root), nil, nil
+		}
+
+		out := replaceResult{Root: args.Root, DryRun: args.DryRun, Files: []replaceFileResult{}, Truncated: candidates.Truncated}
+		for _, m := range candidates.Matches {
+			content, err := os.ReadFile(m.Abs)
+			if err != nil {
+				return errFromErr(err, m.Path), nil, nil
+			}
+			if !utf8.Valid(content) {
+				continue // not a text file: nothing here for search/replace to act on
+			}
+
+			var newContent []byte
+			var count int
+			if re != nil {
+				count = len(re.FindAllIndex(content, -1))
+				if count > 0 {
+					newContent = re.ReplaceAll(content, []byte(args.Replace))
+				}
+			} else {
+				count = strings.Count(string(content), args.Search)
+				if count > 0 {
+					newContent = []byte(strings.ReplaceAll(string(content), args.Search, args.Replace))
+				}
+			}
+			if count == 0 {
+				continue
+			}
+
+			if !args.DryRun {
+				if err := os.WriteFile(m.Abs, newContent, 0o644); err != nil {
+					return errFromErr(err, m.Path), nil, nil
+				}
+			}
+			out.Files = append(out.Files, replaceFileResult{Path: m.Path, Replacements: count})
+			out.FilesChanged++
+			out.TotalReplacements += count
+		}
+
 		return jsonResult(out), out, nil
 	})
 }

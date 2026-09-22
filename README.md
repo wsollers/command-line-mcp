@@ -2,8 +2,8 @@
 
 A generic MCP server, in Go, exposing sandboxed process and filesystem
 primitives: `exec`, `read_file`, `write_file`, `copy_file`, `release_blob`,
-`mkdir`, `ls`, `rm`, plus `list_allowed_dirs` and (optionally)
-`add_allowed_dir`/`remove_allowed_dir`.
+`find`, `replace`, `mkdir`, `ls`, `rm`, plus `list_allowed_dirs` and
+(optionally) `add_allowed_dir`/`remove_allowed_dir`.
 
 Built on the [official Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk)
 (`github.com/modelcontextprotocol/go-sdk`, maintained with Google).
@@ -23,6 +23,9 @@ cmd/shellmcp/          entrypoint: flag/env parsing, wires sandbox + tools
 internal/sandbox/       the allow-list boundary every path is checked against
 internal/tools/         the MCP tool definitions, plus errors.go (structured error codes)
 internal/blob/          in-memory TTL-expiring store backing read_file/write_file blob handles
+internal/walk/          Layer-1 treewalker engine (a working subset) behind find/replace
+internal/glob/          bash-like pathname matching, used by find/replace's name_glob
+internal/rgx/           ripgrep-compatible regex, used by find/replace's content_regex/search
 internal/process/       argv-only process spawn/pipe/timeout, used by exec
 skills/<tool>/SKILL.md  one Claude Skill per tool, for agents that use this server
 examples/               example MCP client configs
@@ -38,6 +41,8 @@ examples/               example MCP client configs
 | `write_file`          | Write or append a file, from text (`content`), raw bytes (`content_base64`), or a previously issued `blob_handle` |
 | `copy_file`           | Copy a file server-side — the content never passes through the caller           |
 | `release_blob`        | Explicitly discard a blob handle before its TTL expires, freeing its memory early |
+| `find`                | Search a directory tree by name glob and/or content regex — no predicate JSON to author |
+| `replace`              | Find-and-replace (literal or regex) across every file under a directory matching a name glob, with `dry_run` preview |
 | `mkdir`               | Create a directory (optionally `-p` style)                                     |
 | `ls`                  | List a directory's entries (name, type, size)                                  |
 | `rm`                  | Remove a file, or a directory recursively                                      |
@@ -72,6 +77,26 @@ message in the text content), with `code` drawn from a fixed vocabulary
 `PROCESS_START_FAILED`, `IO_ERROR`) so a calling agent can branch on
 failure kind programmatically instead of pattern-matching a message
 string. See `docs/api-spec.md` §4 and `internal/tools/errors.go`.
+
+## `find` / `replace`
+
+Both are a thin, flat-argument surface over `internal/walk`, an internal
+recursive treewalker — the caller fills in `root` plus a `name_glob`
+and/or `content_regex`/`search`, and the tool builds the predicate tree
+server-side. There is deliberately no tool that accepts a predicate tree
+directly: composing correctly-nested, correctly-discriminated JSON by
+hand is a much easier way to get something that parses but doesn't mean
+what was intended than filling in a handful of named fields is. See
+`docs/api-spec.md` §8–§9 for the full two-layer design (an internal
+engine plus narrow named tools now; a generic, operator-gated escape
+hatch is deferred).
+
+Both tools skip hidden (dot-prefixed) files and directories unconditionally
+and never descend into a symlinked directory; a symlink whose resolved
+target falls outside every allowed root is skipped rather than followed.
+`replace` skips any file that isn't valid UTF-8 rather than risk
+corrupting binary content, and always call it with `dry_run: true` first
+to preview a multi-file change before writing anything.
 
 ## Design decisions
 
@@ -226,12 +251,13 @@ Because it's a static binary, this is the entire deployment: point
 ## Skills
 
 `skills/<tool>/SKILL.md` — one per tool (`exec`, `read-file`, `write-file`,
-`copy-file`, `release-blob`, `mkdir`, `ls`, `rm`) — documents argument
-shapes, gotchas (no shell in `exec`, no parent-dir creation in
-`write_file`, no recursion in `ls`, no undo in `rm`, the blob-handle
-threshold and TTL for `read_file`/`write_file`/`release_blob`), and the
-sandboxing behavior common to all of them, written for an agent deciding
-how to use this server rather than for a human reading API docs.
+`copy-file`, `release-blob`, `find`, `replace`, `mkdir`, `ls`, `rm`) —
+documents argument shapes, gotchas (no shell in `exec`, no parent-dir
+creation in `write_file`, no recursion in `ls`, no undo in `rm`, the
+blob-handle threshold and TTL for `read_file`/`write_file`/`release_blob`,
+always previewing `replace` with `dry_run` first), and the sandboxing
+behavior common to all of them, written for an agent deciding how to use
+this server rather than for a human reading API docs.
 
 ## Extending it
 
