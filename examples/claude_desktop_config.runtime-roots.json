@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "shellmcp": {
+      "command": "/absolute/path/to/shellmcp",
+      "args": [
+        "-root", "/absolute/path/to/primary/dir",
+        "-root", "/absolute/path/to/second/dir",
+        "-allow-runtime-roots"
+      ]
+    }
+  }
+}
