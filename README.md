@@ -1,8 +1,9 @@
 # command-line-mcp (shellmcp)
 
 A generic MCP server, in Go, exposing sandboxed process and filesystem
-primitives: `exec`, `read_file`, `write_file`, `mkdir`, `ls`, `rm`, plus
-`list_allowed_dirs` and (optionally) `add_allowed_dir`/`remove_allowed_dir`.
+primitives: `exec`, `read_file`, `write_file`, `copy_file`, `release_blob`,
+`mkdir`, `ls`, `rm`, plus `list_allowed_dirs` and (optionally)
+`add_allowed_dir`/`remove_allowed_dir`.
 
 Built on the [official Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk)
 (`github.com/modelcontextprotocol/go-sdk`, maintained with Google).
@@ -20,7 +21,8 @@ executable" under `ldd`. Deployment is copying one file.
 ```
 cmd/shellmcp/          entrypoint: flag/env parsing, wires sandbox + tools
 internal/sandbox/       the allow-list boundary every path is checked against
-internal/tools/         the seven/nine MCP tool definitions
+internal/tools/         the MCP tool definitions, plus errors.go (structured error codes)
+internal/blob/          in-memory TTL-expiring store backing read_file/write_file blob handles
 internal/process/       argv-only process spawn/pipe/timeout, used by exec
 skills/<tool>/SKILL.md  one Claude Skill per tool, for agents that use this server
 examples/               example MCP client configs
@@ -32,8 +34,10 @@ examples/               example MCP client configs
 | Tool                 | What it does                                                                 |
 |----------------------|-------------------------------------------------------------------------------|
 | `exec`                | Spawn a process as an argv array (no shell), pipe stdin, capture stdout/stderr/exit code, with a timeout |
-| `read_file`           | Read a text file                                                               |
-| `write_file`          | Write or append to a text file                                                 |
+| `read_file`           | Read a file; returns text directly, base64 for smaller binary content, or a `blob_handle` (see below) once the content exceeds 256 KiB |
+| `write_file`          | Write or append a file, from text (`content`), raw bytes (`content_base64`), or a previously issued `blob_handle` |
+| `copy_file`           | Copy a file server-side — the content never passes through the caller           |
+| `release_blob`        | Explicitly discard a blob handle before its TTL expires, freeing its memory early |
 | `mkdir`               | Create a directory (optionally `-p` style)                                     |
 | `ls`                  | List a directory's entries (name, type, size)                                  |
 | `rm`                  | Remove a file, or a directory recursively                                      |
@@ -43,6 +47,31 @@ examples/               example MCP client configs
 
 Each tool's own `skills/<tool>/SKILL.md` has the argument-level detail and
 usage guidance; this README covers the server as a whole.
+
+## Blob handles
+
+`read_file` inlines small content directly (`text` or `content_base64`).
+Once the bytes exceed 256 KiB, it instead stores them server-side and
+returns a `blob_handle` — an opaque, random, TTL-expiring (15 minutes)
+reference — so a large file never has to round-trip through the caller's
+context just to move from one tool call to the next. `write_file` accepts
+`blob_handle` in place of `content`/`content_base64` to write those bytes
+back out, and `release_blob` frees a handle early instead of waiting for
+its TTL. See `docs/api-spec.md` §3.2 and §18 for the full design, and
+`internal/blob/blob.go` for the implementation.
+
+## Structured error codes
+
+Every tool failure returns `{"ok": false, "error": {"code", "message",
+"path", "details"}}` as structured content (in addition to a human-readable
+message in the text content), with `code` drawn from a fixed vocabulary
+(`PATH_NOT_FOUND`, `PATH_ALREADY_EXISTS`, `NOT_A_FILE`,
+`DIRECTORY_NOT_EMPTY`, `PERMISSION_DENIED`, `PATH_OUTSIDE_ROOT`,
+`INVALID_BASE64`, `BOTH_CONTENT_FIELDS_SET`, `NOT_UTF8_TEXT`,
+`BLOB_NOT_FOUND`, `BLOB_EXPIRED`, `INVALID_ARGUMENT`,
+`PROCESS_START_FAILED`, `IO_ERROR`) so a calling agent can branch on
+failure kind programmatically instead of pattern-matching a message
+string. See `docs/api-spec.md` §4 and `internal/tools/errors.go`.
 
 ## Design decisions
 
@@ -197,11 +226,12 @@ Because it's a static binary, this is the entire deployment: point
 ## Skills
 
 `skills/<tool>/SKILL.md` — one per tool (`exec`, `read-file`, `write-file`,
-`mkdir`, `ls`, `rm`) — documents argument shapes, gotchas (no shell in
-`exec`, no parent-dir creation in `write_file`, no recursion in `ls`, no
-undo in `rm`), and the sandboxing behavior common to all of them, written
-for an agent deciding how to use this server rather than for a human
-reading API docs.
+`copy-file`, `release-blob`, `mkdir`, `ls`, `rm`) — documents argument
+shapes, gotchas (no shell in `exec`, no parent-dir creation in
+`write_file`, no recursion in `ls`, no undo in `rm`, the blob-handle
+threshold and TTL for `read_file`/`write_file`/`release_blob`), and the
+sandboxing behavior common to all of them, written for an agent deciding
+how to use this server rather than for a human reading API docs.
 
 ## Extending it
 

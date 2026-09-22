@@ -25,6 +25,7 @@
 package sandbox
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -32,6 +33,23 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+)
+
+// Sentinel errors, wrapped (via %w) into the richer messages Resolve/
+// AddRuntimeRoot/RemoveRuntimeRoot actually return, so a caller can
+// classify a failure precisely with errors.Is instead of matching on
+// message text. See internal/tools' structured error codes, which key off
+// these.
+var (
+	// ErrOutsideRoot means a resolved path (or, for a not-yet-existing
+	// path, its deepest existing ancestor once symlinks are followed)
+	// does not fall inside any currently allowed root.
+	ErrOutsideRoot = errors.New("outside every allowed directory")
+
+	// ErrRuntimeDisabled means AddRuntimeRoot/RemoveRuntimeRoot (and so
+	// add_allowed_dir/remove_allowed_dir) were called on a server not
+	// started with -allow-runtime-roots.
+	ErrRuntimeDisabled = errors.New("runtime directory changes are disabled on this server")
 )
 
 // Root is one allowed directory plus where it came from, for
@@ -81,7 +99,7 @@ func (s *Sandbox) RuntimeAllowed() bool {
 // instance, or if the directory doesn't exist.
 func (s *Sandbox) AddRuntimeRoot(p string) (string, error) {
 	if !s.allowRuntime {
-		return "", fmt.Errorf("runtime directory changes are disabled on this server; start it with -allow-runtime-roots to enable add_allowed_dir/remove_allowed_dir")
+		return "", fmt.Errorf("%w; start it with -allow-runtime-roots to enable add_allowed_dir/remove_allowed_dir", ErrRuntimeDisabled)
 	}
 	abs, err := resolveExistingDir(p)
 	if err != nil {
@@ -101,7 +119,7 @@ func (s *Sandbox) AddRuntimeRoot(p string) (string, error) {
 // a matching entry was found.
 func (s *Sandbox) RemoveRuntimeRoot(p string) (bool, error) {
 	if !s.allowRuntime {
-		return false, fmt.Errorf("runtime directory changes are disabled on this server; start it with -allow-runtime-roots to enable add_allowed_dir/remove_allowed_dir")
+		return false, fmt.Errorf("%w; start it with -allow-runtime-roots to enable add_allowed_dir/remove_allowed_dir", ErrRuntimeDisabled)
 	}
 	abs, err := filepath.Abs(p)
 	if err != nil {
@@ -217,7 +235,7 @@ func (s *Sandbox) Resolve(p string) (string, error) {
 	}
 
 	if !s.withinAnyRoot(joined) {
-		return "", fmt.Errorf("path %q is outside every allowed directory", p)
+		return "", fmt.Errorf("path %q is %w", p, ErrOutsideRoot)
 	}
 
 	// Resolve the deepest existing ancestor's symlinks too, so a symlink
@@ -227,7 +245,7 @@ func (s *Sandbox) Resolve(p string) (string, error) {
 	for {
 		if resolved, err := filepath.EvalSymlinks(check); err == nil {
 			if !s.withinAnyRoot(resolved) {
-				return "", fmt.Errorf("path %q escapes every allowed directory via a symlink", p)
+				return "", fmt.Errorf("path %q escapes every allowed directory via a symlink (%w)", p, ErrOutsideRoot)
 			}
 			break
 		}

@@ -1,0 +1,8 @@
+[package]
+name = "rgx_oracle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+regex = "1"
+base64 = "0.22"

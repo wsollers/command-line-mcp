@@ -4,15 +4,34 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/wsollers/command-line-mcp/internal/blob"
 	"github.com/wsollers/command-line-mcp/internal/process"
 	"github.com/wsollers/command-line-mcp/internal/sandbox"
 )
+
+// blobThresholdBytes is the read_file content size above which a result is
+// returned as a blob handle instead of inline base64 — see
+// docs/api-spec.md §3.2/§18. Inlining a multi-megabyte base64 string into
+// a tool result burns enormous context for a payload the caller can only
+// relay elsewhere unchanged anyway.
+const blobThresholdBytes = 256 * 1024
+
+// blobTTL is how long a read_file blob handle stays valid before it must
+// be re-read. Deliberately short: a handle is meant to be consumed
+// promptly within one task (read, then write or release), not held
+// indefinitely.
+const blobTTL = 15 * time.Minute
 
 // refreshClientRoots asks the connected client (via req.Session) for its
 // current MCP roots and merges them into sb, before every path-touching
@@ -50,9 +69,12 @@ func refreshClientRoots(ctx context.Context, req *mcp.CallToolRequest, sb *sandb
 // Register adds every tool to server, enforcing sb on all path and cwd
 // arguments.
 func Register(server *mcp.Server, sb *sandbox.Sandbox) {
+	bs := blob.New(blobTTL)
 	registerExec(server, sb)
-	registerReadFile(server, sb)
-	registerWriteFile(server, sb)
+	registerReadFile(server, sb, bs)
+	registerWriteFile(server, sb, bs)
+	registerCopyFile(server, sb)
+	registerReleaseBlob(server, bs)
 	registerMkdir(server, sb)
 	registerLs(server, sb)
 	registerRm(server, sb)
@@ -85,12 +107,12 @@ func registerExec(server *mcp.Server, sb *sandbox.Sandbox) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args execArgs) (*mcp.CallToolResult, any, error) {
 		refreshClientRoots(ctx, req, sb)
 		if args.Command == "" {
-			return errResult("command must not be empty"), nil, nil
+			return codedError(codeInvalidArgument, "", "command must not be empty", nil), nil, nil
 		}
 
 		cwd, err := sb.Resolve(args.Cwd)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Cwd), nil, nil
 		}
 
 		timeout := 30 * time.Second
@@ -107,7 +129,7 @@ func registerExec(server *mcp.Server, sb *sandbox.Sandbox) {
 			Timeout: timeout,
 		})
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return codedError(codeProcessStartFailed, "", err.Error(), map[string]any{"command": args.Command}), nil, nil
 		}
 		return jsonResult(res), res, nil
 	})
@@ -119,23 +141,111 @@ func registerExec(server *mcp.Server, sb *sandbox.Sandbox) {
 
 type readFileArgs struct {
 	Path string `json:"path" jsonschema:"file path, relative to the primary allowed root or absolute inside any allowed root"`
+	// Encoding controls how content comes back. It is a flag the
+	// caller SETS (one of three fixed words), never content the
+	// caller has to CONSTRUCT — the base64 payload itself, when one
+	// is produced, is always built by this server, never typed out
+	// by an MCP client. See the package doc for why that distinction
+	// matters.
+	Encoding string `json:"encoding,omitempty" jsonschema:"how to return the content: one of \"auto\" (default: returns text if the file is valid UTF-8, base64 otherwise), \"text\" (forces UTF-8 text and errors if the file isn't valid UTF-8), or \"base64\" (always base64-encodes the raw bytes)"`
 }
 
-func registerReadFile(server *mcp.Server, sb *sandbox.Sandbox) {
+// readFileResult always reports which encoding was actually used —
+// under "auto" the caller doesn't choose, so it needs telling — and
+// carries exactly one of Text/ContentBase64/BlobHandle depending on that
+// outcome.
+type readFileResult struct {
+	Path          string `json:"path"`
+	Encoding      string `json:"encoding"` // "text", "base64", or "blob": what was actually used
+	SizeBytes     int64  `json:"size_bytes"`
+	Text          string `json:"text,omitempty"`
+	ContentBase64 string `json:"content_base64,omitempty"`
+	BlobHandle    string `json:"blob_handle,omitempty"`
+	MediaType     string `json:"media_type,omitempty"`
+}
+
+func registerReadFile(server *mcp.Server, sb *sandbox.Sandbox, bs *blob.Store) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "read_file",
-		Description: "Read the full contents of a text file inside an allowed root.",
+		Name: "read_file",
+		Description: "Read the full contents of a file inside an allowed root. Returns UTF-8 text directly by default; " +
+			"a file that isn't valid UTF-8 (e.g. a binary file) is automatically returned base64-encoded instead — " +
+			"pass encoding=\"base64\" to always get base64, or encoding=\"text\" to require text and error otherwise. " +
+			"A binary result larger than the inline threshold comes back as a blob_handle instead of inline base64 — " +
+			"pass that handle straight to write_file's blob_handle argument rather than trying to read or reconstruct it.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args readFileArgs) (*mcp.CallToolResult, any, error) {
 		refreshClientRoots(ctx, req, sb)
 		p, err := sb.Resolve(args.Path)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(data)}}}, nil, nil
+
+		requested := args.Encoding
+		if requested == "" {
+			requested = "auto"
+		}
+
+		var actual string
+		switch requested {
+		case "auto":
+			if utf8.Valid(data) {
+				actual = "text"
+			} else {
+				actual = "base64"
+			}
+		case "text":
+			if !utf8.Valid(data) {
+				return codedError(codeNotUTF8Text, args.Path, fmt.Sprintf(
+					"%s is not valid UTF-8 text; retry with encoding=\"base64\" or encoding=\"auto\"", args.Path,
+				), nil), nil, nil
+			}
+			actual = "text"
+		case "base64":
+			actual = "base64"
+		default:
+			return codedError(codeInvalidArgument, args.Path, fmt.Sprintf(
+				`unknown encoding %q: must be "auto", "text", or "base64"`, args.Encoding,
+			), nil), nil, nil
+		}
+
+		out := readFileResult{Path: args.Path, SizeBytes: int64(len(data))}
+
+		if actual == "base64" && len(data) > blobThresholdBytes {
+			mediaType := http.DetectContentType(data)
+			handle, err := bs.Put(data, mediaType)
+			if err != nil {
+				return codedError(codeIOError, args.Path, err.Error(), nil), nil, nil
+			}
+			out.Encoding = "blob"
+			out.BlobHandle = handle
+			out.MediaType = mediaType
+			note := fmt.Sprintf(
+				"%s is %d bytes of binary content, over the %d-byte inline threshold; returned as blob handle %s "+
+					"(pass this straight to write_file's blob_handle argument, or release_blob to discard it early)",
+				args.Path, len(data), blobThresholdBytes, handle,
+			)
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: note}}}, out, nil
+		}
+
+		var wireText string
+		if actual == "text" {
+			out.Encoding = "text"
+			out.Text = string(data)
+			wireText = out.Text
+		} else {
+			out.Encoding = "base64"
+			out.ContentBase64 = base64.StdEncoding.EncodeToString(data)
+			wireText = out.ContentBase64
+		}
+		// Content carries the raw payload directly (text, or the
+		// base64 string) so it's immediately usable without unwrapping
+		// JSON; StructuredContent (the returned out value) carries the
+		// same payload plus the path/encoding/size metadata for a
+		// caller that wants to branch on it programmatically.
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: wireText}}}, out, nil
 	})
 }
 
@@ -144,20 +254,65 @@ func registerReadFile(server *mcp.Server, sb *sandbox.Sandbox) {
 // ---------------------------------------------------------------------------
 
 type writeFileArgs struct {
-	Path    string `json:"path" jsonschema:"file path, relative to the primary allowed root or absolute inside any allowed root"`
-	Content string `json:"content" jsonschema:"text content to write"`
-	Append  bool   `json:"append,omitempty" jsonschema:"append instead of overwriting (default: overwrite)"`
+	Path string `json:"path" jsonschema:"file path, relative to the primary allowed root or absolute inside any allowed root"`
+	// Exactly one of Content / ContentBase64 / BlobHandle may be set.
+	// ContentBase64 and BlobHandle both exist for round-tripping a value
+	// a prior read_file call (or, for BlobHandle, the blob-handle path
+	// specifically) already handed the caller — never for a caller to
+	// hand-author fresh base64 text; see the package doc.
+	Content       string `json:"content,omitempty" jsonschema:"UTF-8 text content to write"`
+	ContentBase64 string `json:"content_base64,omitempty" jsonschema:"base64-encoded raw bytes to write, for binary content (e.g. a blob returned by read_file with encoding=\"base64\"); mutually exclusive with content and blob_handle"`
+	BlobHandle    string `json:"blob_handle,omitempty" jsonschema:"a handle previously returned by read_file when its content exceeded the inline size threshold; mutually exclusive with content and content_base64"`
+	Append        bool   `json:"append,omitempty" jsonschema:"append instead of overwriting (default: overwrite)"`
 }
 
-func registerWriteFile(server *mcp.Server, sb *sandbox.Sandbox) {
+func registerWriteFile(server *mcp.Server, sb *sandbox.Sandbox, bs *blob.Store) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "write_file",
-		Description: "Write (or append to) a text file inside an allowed root. The parent directory must already exist; use mkdir first.",
+		Name: "write_file",
+		Description: "Write (or append to) a file inside an allowed root. The parent directory must already exist; use mkdir first. " +
+			"Provide exactly one of content (UTF-8 text), content_base64 (raw bytes, base64-encoded), or blob_handle " +
+			"(a handle read_file returned for a large binary file).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args writeFileArgs) (*mcp.CallToolResult, any, error) {
 		refreshClientRoots(ctx, req, sb)
+
+		fieldsSet := 0
+		if args.Content != "" {
+			fieldsSet++
+		}
+		if args.ContentBase64 != "" {
+			fieldsSet++
+		}
+		if args.BlobHandle != "" {
+			fieldsSet++
+		}
+		if fieldsSet > 1 {
+			return codedError(codeBothContentFields, args.Path,
+				"provide only one of content, content_base64, or blob_handle", nil), nil, nil
+		}
+
+		var data []byte
+		switch {
+		case args.BlobHandle != "":
+			d, _, err := bs.Get(args.BlobHandle)
+			if err != nil {
+				return codedError(blobErrCode(err), args.Path, err.Error(),
+					map[string]any{"handle": args.BlobHandle}), nil, nil
+			}
+			data = d
+		case args.ContentBase64 != "":
+			decoded, err := base64.StdEncoding.DecodeString(args.ContentBase64)
+			if err != nil {
+				return codedError(codeInvalidBase64, args.Path,
+					fmt.Sprintf("content_base64 is not valid base64: %v", err), nil), nil, nil
+			}
+			data = decoded
+		default:
+			data = []byte(args.Content)
+		}
+
 		p, err := sb.Resolve(args.Path)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		flags := os.O_CREATE | os.O_WRONLY
 		if args.Append {
@@ -167,14 +322,105 @@ func registerWriteFile(server *mcp.Server, sb *sandbox.Sandbox) {
 		}
 		f, err := os.OpenFile(p, flags, 0o644)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		defer f.Close()
-		if _, err := f.WriteString(args.Content); err != nil {
-			return errResult(err.Error()), nil, nil
+		if _, err := f.Write(data); err != nil {
+			return errFromErr(err, args.Path), nil, nil
 		}
-		out := map[string]any{"path": args.Path, "bytes_written": len(args.Content)}
+		out := map[string]any{"path": args.Path, "bytes_written": len(data)}
 		return jsonResult(out), out, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// release_blob
+// ---------------------------------------------------------------------------
+
+type releaseBlobArgs struct {
+	Handle string `json:"handle" jsonschema:"a blob handle previously returned by read_file"`
+}
+
+func registerReleaseBlob(server *mcp.Server, bs *blob.Store) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "release_blob",
+		Description: "Release a blob handle returned by read_file before it expires on its own, freeing the " +
+			"server-held bytes early. Not required — handles expire automatically after a fixed TTL — but worth " +
+			"calling once a caller is done relaying a large binary elsewhere within the same task.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args releaseBlobArgs) (*mcp.CallToolResult, any, error) {
+		released := bs.Release(args.Handle)
+		out := map[string]any{"handle": args.Handle, "released": released}
+		return jsonResult(out), out, nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// copy_file
+// ---------------------------------------------------------------------------
+
+type copyFileArgs struct {
+	Src       string `json:"src" jsonschema:"source file path, relative to the primary allowed root or absolute inside any allowed root"`
+	Dst       string `json:"dst" jsonschema:"destination file path, relative to the primary allowed root or absolute inside any allowed root"`
+	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"overwrite dst if it already exists (default: refuse)"`
+}
+
+func registerCopyFile(server *mcp.Server, sb *sandbox.Sandbox) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "copy_file",
+		Description: "Copy a file inside an allowed root, entirely server-side. Prefer this over reading a file and " +
+			"writing it back out for duplicating or moving binary content: the bytes never pass through the caller, " +
+			"so there's no size or encoding concern. Source and destination must both be regular files (no directories) " +
+			"inside an allowed root; the destination's parent directory must already exist.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args copyFileArgs) (*mcp.CallToolResult, any, error) {
+		refreshClientRoots(ctx, req, sb)
+
+		srcPath, err := sb.Resolve(args.Src)
+		if err != nil {
+			return errFromErr(err, args.Src), nil, nil
+		}
+		dstPath, err := sb.Resolve(args.Dst)
+		if err != nil {
+			return errFromErr(err, args.Dst), nil, nil
+		}
+
+		srcInfo, err := os.Stat(srcPath)
+		if err != nil {
+			return errFromErr(err, args.Src), nil, nil
+		}
+		if !srcInfo.Mode().IsRegular() {
+			return codedError(codeNotAFile, args.Src, fmt.Sprintf("%s is not a regular file", args.Src), nil), nil, nil
+		}
+
+		if !args.Overwrite {
+			if _, err := os.Stat(dstPath); err == nil {
+				return codedError(codePathAlreadyExists, args.Dst,
+					fmt.Sprintf("%s already exists; pass overwrite=true to replace it", args.Dst), nil), nil, nil
+			} else if !os.IsNotExist(err) {
+				return errFromErr(err, args.Dst), nil, nil
+			}
+		}
+
+		in, err := os.Open(srcPath)
+		if err != nil {
+			return errFromErr(err, args.Src), nil, nil
+		}
+		defer in.Close()
+
+		out, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode().Perm())
+		if err != nil {
+			return errFromErr(err, args.Dst), nil, nil
+		}
+		written, copyErr := io.Copy(out, in)
+		closeErr := out.Close()
+		if copyErr != nil {
+			return errFromErr(copyErr, args.Dst), nil, nil
+		}
+		if closeErr != nil {
+			return errFromErr(closeErr, args.Dst), nil, nil
+		}
+
+		result := map[string]any{"src": args.Src, "dst": args.Dst, "bytes_written": written}
+		return jsonResult(result), result, nil
 	})
 }
 
@@ -195,7 +441,7 @@ func registerMkdir(server *mcp.Server, sb *sandbox.Sandbox) {
 		refreshClientRoots(ctx, req, sb)
 		p, err := sb.Resolve(args.Path)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		if args.Recursive {
 			err = os.MkdirAll(p, 0o755)
@@ -203,7 +449,7 @@ func registerMkdir(server *mcp.Server, sb *sandbox.Sandbox) {
 			err = os.Mkdir(p, 0o755)
 		}
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		out := map[string]any{"path": args.Path, "created": true}
 		return jsonResult(out), out, nil
@@ -240,11 +486,11 @@ func registerLs(server *mcp.Server, sb *sandbox.Sandbox) {
 		refreshClientRoots(ctx, req, sb)
 		p, err := sb.Resolve(args.Path)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		entries, err := os.ReadDir(p)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		out := make([]lsEntry, 0, len(entries))
 		for _, e := range entries {
@@ -286,11 +532,15 @@ func registerRm(server *mcp.Server, sb *sandbox.Sandbox) {
 		refreshClientRoots(ctx, req, sb)
 		p, err := sb.Resolve(args.Path)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		for _, r := range sb.Roots() {
 			if p == r.Path {
-				return errResult("refusing to remove an allowed root directory itself"), nil, nil
+				// A policy-level refusal, not an OS error — PERMISSION_DENIED
+				// is the closest fit in the fixed vocabulary ("you may not
+				// do this," same as an OS permission bit would say).
+				return codedError(codePermissionDenied, args.Path,
+					"refusing to remove an allowed root directory itself", nil), nil, nil
 			}
 		}
 		if args.Recursive {
@@ -299,7 +549,7 @@ func registerRm(server *mcp.Server, sb *sandbox.Sandbox) {
 			err = os.Remove(p)
 		}
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		out := map[string]any{"path": args.Path, "removed": true}
 		return jsonResult(out), out, nil
@@ -346,7 +596,7 @@ func registerAddAllowedDir(server *mcp.Server, sb *sandbox.Sandbox) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args addAllowedDirArgs) (*mcp.CallToolResult, any, error) {
 		abs, err := sb.AddRuntimeRoot(args.Path)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		out := map[string]any{"path": abs, "added": true}
 		return jsonResult(out), out, nil
@@ -365,7 +615,7 @@ func registerRemoveAllowedDir(server *mcp.Server, sb *sandbox.Sandbox) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args removeAllowedDirArgs) (*mcp.CallToolResult, any, error) {
 		removed, err := sb.RemoveRuntimeRoot(args.Path)
 		if err != nil {
-			return errResult(err.Error()), nil, nil
+			return errFromErr(err, args.Path), nil, nil
 		}
 		out := map[string]any{"path": args.Path, "removed": removed}
 		return jsonResult(out), out, nil
@@ -376,17 +626,10 @@ func registerRemoveAllowedDir(server *mcp.Server, sb *sandbox.Sandbox) {
 // helpers
 // ---------------------------------------------------------------------------
 
-func errResult(msg string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		IsError: true,
-		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
-	}
-}
-
 func jsonResult(v any) *mcp.CallToolResult {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		return errResult(err.Error())
+		return codedError(codeIOError, "", err.Error(), nil)
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}
 }
